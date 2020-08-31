@@ -1,6 +1,7 @@
 package org.benf.cfr.reader.util.output;
 
 import org.benf.cfr.reader.bytecode.analysis.types.JavaTypeInstance;
+import org.benf.cfr.reader.bytecode.analysis.types.MethodPrototype;
 import org.benf.cfr.reader.entities.Method;
 import org.benf.cfr.reader.util.DecompilerComment;
 import org.benf.cfr.reader.util.DecompilerCommentSource;
@@ -53,11 +54,14 @@ public class FileSummaryDumper implements SummaryDumper {
             }
             if (method != lastMethod) {
                 if (method != null) {
-                    writer.write(method.getMethodPrototype().toString() + "\n");
+                    MethodPrototype prototype = method.getMethodPrototype();
+//                    writer.write(prototype.toString() + "\n");
+                    writer.write("FAILED_METHOD:\t" + prototype.getClassType().getRawName() + " " +
+                            prototype.getReturnType() + " " + prototype.toString() + "\n");
                 }
                 lastMethod = method;
             }
-            writer.write("  " + error + "\n");
+//            writer.write("  " + error + "\n");
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }
