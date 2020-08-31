@@ -1,5 +1,8 @@
 package org.benf.cfr.reader.bytecode;
 
+import org.benf.cfr.reader.bytecode.analysis.loc.BytecodeLocFactory;
+import org.benf.cfr.reader.bytecode.analysis.loc.BytecodeLocFactoryImpl;
+import org.benf.cfr.reader.bytecode.analysis.loc.BytecodeLocFactoryStub;
 import org.benf.cfr.reader.bytecode.analysis.opgraph.Op01WithProcessedDataAndByteJumps;
 import org.benf.cfr.reader.bytecode.analysis.opgraph.Op02WithProcessedDataAndRefs;
 import org.benf.cfr.reader.bytecode.analysis.opgraph.Op03Blocks;
@@ -110,6 +113,7 @@ public class CodeAnalyser {
 
     private static final RecoveryOptions recoverPre1 = new RecoveryOptions(recover0,
             new RecoveryOption.TrooleanRO(OptionsImpl.FORCE_TOPSORT, Troolean.TRUE, DecompilerComment.AGGRESSIVE_TOPOLOGICAL_SORT),
+            new RecoveryOption.TrooleanRO(OptionsImpl.AGGRESSIVE_DUFF, Troolean.TRUE),
             new RecoveryOption.TrooleanRO(OptionsImpl.FOR_LOOP_CAPTURE, Troolean.TRUE),
             new RecoveryOption.BooleanRO(OptionsImpl.LENIENT, Boolean.TRUE),
             new RecoveryOption.TrooleanRO(OptionsImpl.FORCE_COND_PROPAGATE, Troolean.TRUE),
@@ -223,7 +227,7 @@ public class CodeAnalyser {
      * Expensive mechanism for getting a single bytecode instruction.  We should only use this when recovering
      * from illegal instructions.
      */
-    Op01WithProcessedDataAndByteJumps getSingleInstr(ByteData rawCode, int offset) {
+    private Op01WithProcessedDataAndByteJumps getSingleInstr(ByteData rawCode, int offset) {
         OffsettingByteData bdCode = rawCode.getOffsettingOffsetData(offset);
         JVMInstr instr = JVMInstr.find(bdCode.getS1At(0));
         return instr.createOperation(bdCode, cp, offset);
@@ -299,10 +303,11 @@ public class CodeAnalyser {
         List<Op01WithProcessedDataAndByteJumps> op1list = ListFactory.newList();
         List<Op02WithProcessedDataAndRefs> op2list = ListFactory.newList();
         // Now walk the indexed ops
+        BytecodeLocFactory locFactory = options.getOption(OptionsImpl.TRACK_BYTECODE_LOC) ? BytecodeLocFactoryImpl.INSTANCE : BytecodeLocFactoryStub.INSTANCE;
         for (int x = 0; x < instrs.size(); ++x) {
             Op01WithProcessedDataAndByteJumps op1 = instrs.get(x);
             op1list.add(op1);
-            Op02WithProcessedDataAndRefs op2 = op1.createOp2(cp, x);
+            Op02WithProcessedDataAndRefs op2 = op1.createOp2(cp, x, locFactory, method);
             op2list.add(op2);
         }
 
@@ -318,7 +323,7 @@ public class CodeAnalyser {
             } catch (UnverifiableJumpException e) {
                 comments.addComment(DecompilerComment.UNVERIFIABLE_BYTECODE_BAD_JUMP);
                 // we can handle this if we fall back and reprocess the bytecode.
-                generateUnverifiable(x, op1list, op2list, lutByIdx, lutByOffset);
+                generateUnverifiable(x, op1list, op2list, lutByIdx, lutByOffset, locFactory);
                 try {
                     targetIdxs = op1list.get(x).getAbsoluteIndexJumps(offsetOfThisInstruction, lutByOffset);
                 } catch (UnverifiableJumpException e2) {
@@ -433,7 +438,7 @@ public class CodeAnalyser {
         TypeHintRecovery typeHintRecovery = options.optionIsSet(OptionsImpl.USE_RECOVERED_ITERATOR_TYPE_HINTS) ?
                 new TypeHintRecoveryImpl(bytecodeMeta) : TypeHintRecoveryNone.INSTANCE;
 
-        List<Op03SimpleStatement> op03SimpleParseNodes = Op02WithProcessedDataAndRefs.convertToOp03List(op2list, method, variableFactory, blockIdentifierFactory, dcCommonState, typeHintRecovery);
+        List<Op03SimpleStatement> op03SimpleParseNodes = Op02WithProcessedDataAndRefs.convertToOp03List(op2list, method, variableFactory, blockIdentifierFactory, dcCommonState, comments, typeHintRecovery);
         // Renumber, just in case JSR stage (or something) has left bad labellings.
         op03SimpleParseNodes = Cleaner.sortAndRenumber(op03SimpleParseNodes);
 
@@ -458,6 +463,9 @@ public class CodeAnalyser {
         Op03Rewriters.nopIsolatedStackValues(op03SimpleParseNodes);
 
         Op03SimpleStatement.assignSSAIdentifiers(method, op03SimpleParseNodes);
+
+        // Fix static instance usage.
+        Op03Rewriters.condenseStaticInstances(op03SimpleParseNodes);
 
         // Condense pointless assignments
         LValueProp.condenseLValues(op03SimpleParseNodes);
@@ -492,18 +500,11 @@ public class CodeAnalyser {
 
         //      Op03SimpleStatement.removePointlessExpressionStatements(op03SimpleParseNodes);
 
-        // Rewrite new / constructor pairs.
         AnonymousClassUsage anonymousClassUsage = new AnonymousClassUsage();
-        /*
-         * Check for usage of stackValues which don't have SSA data - this means they're used
-         * in an uninitialised context. (see proof_wrong_path).
-         *
-         * If that's the case, they must have been used after new, but before init (which is naughty).
-         *
-         */
 
-
+        // Rewrite new / constructor pairs.
         Op03Rewriters.condenseConstruction(dcCommonState, method, op03SimpleParseNodes, anonymousClassUsage);
+        op03SimpleParseNodes = Cleaner.sortAndRenumber(op03SimpleParseNodes);
         LValueProp.condenseLValues(op03SimpleParseNodes);
         Op03Rewriters.condenseLValueChain1(op03SimpleParseNodes);
 
@@ -579,7 +580,12 @@ public class CodeAnalyser {
                 Op03Rewriters.replaceReturningIfs(op03SimpleParseNodes, true);
             }
         }
-
+        if (options.getOption(OptionsImpl.AGGRESSIVE_DUFF) == Troolean.TRUE) {
+            if (bytecodeMeta.has(BytecodeMeta.CodeInfoFlag.SWITCHES)) {
+                op03SimpleParseNodes = Cleaner.sortAndRenumber(op03SimpleParseNodes);
+                op03SimpleParseNodes = SwitchReplacer.rewriteDuff(op03SimpleParseNodes, variableFactory, comments, options);
+            }
+        }
         /*
          * Push constants through conditionals to returns ( move the returns back )- i.e. if the value we're
          * returning is deterministic, return that.
@@ -924,18 +930,18 @@ public class CodeAnalyser {
         return new AnalysisResultSuccessful(comments, block, anonymousClassUsage);
     }
 
-    private void generateUnverifiable(int x, List<Op01WithProcessedDataAndByteJumps> op1list, List<Op02WithProcessedDataAndRefs> op2list, Map<Integer, Integer> lutByIdx, SortedMap<Integer, Integer> lutByOffset) {
+    private void generateUnverifiable(int x, List<Op01WithProcessedDataAndByteJumps> op1list, List<Op02WithProcessedDataAndRefs> op2list, Map<Integer, Integer> lutByIdx, SortedMap<Integer, Integer> lutByOffset, BytecodeLocFactory locFactory) {
         Op01WithProcessedDataAndByteJumps instr = op1list.get(x);
         int thisRaw = instr.getOriginalRawOffset();
         int[] thisTargets = instr.getRawTargetOffsets();
         for (int target : thisTargets) {
             if (null == lutByOffset.get(target + thisRaw)) {
-                generateUnverifiableInstr(target + thisRaw, op1list, op2list, lutByIdx, lutByOffset);
+                generateUnverifiableInstr(target + thisRaw, op1list, op2list, lutByIdx, lutByOffset, locFactory);
             }
         }
     }
 
-    private void generateUnverifiableInstr(int offset, List<Op01WithProcessedDataAndByteJumps> op1list, List<Op02WithProcessedDataAndRefs> op2list, Map<Integer, Integer> lutByIdx, SortedMap<Integer, Integer> lutByOffset) {
+    private void generateUnverifiableInstr(int offset, List<Op01WithProcessedDataAndByteJumps> op1list, List<Op02WithProcessedDataAndRefs> op2list, Map<Integer, Integer> lutByIdx, SortedMap<Integer, Integer> lutByOffset, BytecodeLocFactory locFactory) {
         ByteData rawData = originalCodeAttribute.getRawData();
         int codeLength = originalCodeAttribute.getCodeLength();
         do {
@@ -954,7 +960,7 @@ public class CodeAnalyser {
             op1list.add(op01);
             lutByIdx.put(targetIdx, offset);
             lutByOffset.put(offset, targetIdx);
-            Op02WithProcessedDataAndRefs op02 = op01.createOp2(cp, targetIdx);
+            Op02WithProcessedDataAndRefs op02 = op01.createOp2(cp, targetIdx, locFactory, method);
             op2list.add(op02);
             if (noTargets) return;
             int nextOffset = offset + op01.getInstructionLength();
@@ -968,7 +974,7 @@ public class CodeAnalyser {
                 rawTargets[0] = nextOffset - fakeOffset;
                 Op01WithProcessedDataAndByteJumps fakeGoto = new Op01WithProcessedDataAndByteJumps(JVMInstr.GOTO, null, rawTargets, fakeOffset);
                 op1list.add(fakeGoto);
-                op2list.add(fakeGoto.createOp2(cp, targetIdx));
+                op2list.add(fakeGoto.createOp2(cp, targetIdx, locFactory, method));
                 return;
             }
             offset = nextOffset;

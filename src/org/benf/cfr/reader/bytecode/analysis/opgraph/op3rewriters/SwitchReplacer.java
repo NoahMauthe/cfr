@@ -1,29 +1,60 @@
 package org.benf.cfr.reader.bytecode.analysis.opgraph.op3rewriters;
 
+import org.benf.cfr.reader.bytecode.analysis.loc.BytecodeLoc;
 import org.benf.cfr.reader.bytecode.analysis.opgraph.InstrIndex;
 import org.benf.cfr.reader.bytecode.analysis.opgraph.Op03SimpleStatement;
 import org.benf.cfr.reader.bytecode.analysis.parse.Expression;
+import org.benf.cfr.reader.bytecode.analysis.parse.LValue;
 import org.benf.cfr.reader.bytecode.analysis.parse.Statement;
+import org.benf.cfr.reader.bytecode.analysis.parse.expression.BooleanExpression;
+import org.benf.cfr.reader.bytecode.analysis.parse.expression.CompOp;
+import org.benf.cfr.reader.bytecode.analysis.parse.expression.ComparisonOperation;
+import org.benf.cfr.reader.bytecode.analysis.parse.expression.LValueExpression;
 import org.benf.cfr.reader.bytecode.analysis.parse.expression.Literal;
+import org.benf.cfr.reader.bytecode.analysis.parse.expression.TernaryExpression;
 import org.benf.cfr.reader.bytecode.analysis.parse.literal.TypedLiteral;
-import org.benf.cfr.reader.bytecode.analysis.parse.statement.*;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.AssignmentSimple;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.CaseStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.CommentStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.GotoStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.IfStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.JumpingStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.Nop;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.RawSwitchStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.ReturnStatement;
+import org.benf.cfr.reader.bytecode.analysis.parse.statement.SwitchStatement;
 import org.benf.cfr.reader.bytecode.analysis.parse.utils.BlockIdentifier;
 import org.benf.cfr.reader.bytecode.analysis.parse.utils.BlockIdentifierFactory;
 import org.benf.cfr.reader.bytecode.analysis.parse.utils.BlockType;
 import org.benf.cfr.reader.bytecode.analysis.parse.utils.JumpType;
+import org.benf.cfr.reader.bytecode.analysis.types.RawJavaType;
 import org.benf.cfr.reader.bytecode.analysis.types.discovery.InferredJavaType;
+import org.benf.cfr.reader.bytecode.analysis.variables.VariableFactory;
 import org.benf.cfr.reader.bytecode.opcode.DecodedSwitch;
 import org.benf.cfr.reader.bytecode.opcode.DecodedSwitchEntry;
 import org.benf.cfr.reader.entities.Method;
-import org.benf.cfr.reader.util.*;
-import org.benf.cfr.reader.util.collections.*;
+import org.benf.cfr.reader.util.CannotPerformDecode;
+import org.benf.cfr.reader.util.ConfusedCFRException;
+import org.benf.cfr.reader.util.DecompilerComment;
+import org.benf.cfr.reader.util.DecompilerComments;
+import org.benf.cfr.reader.util.Troolean;
+import org.benf.cfr.reader.util.collections.Functional;
+import org.benf.cfr.reader.util.collections.ListFactory;
+import org.benf.cfr.reader.util.collections.MapFactory;
+import org.benf.cfr.reader.util.collections.SetFactory;
+import org.benf.cfr.reader.util.collections.SetUtil;
 import org.benf.cfr.reader.util.functors.BinaryProcedure;
 import org.benf.cfr.reader.util.getopt.Options;
 import org.benf.cfr.reader.util.getopt.OptionsImpl;
 import org.benf.cfr.reader.util.graph.GraphVisitor;
 import org.benf.cfr.reader.util.graph.GraphVisitorDFS;
 
-import java.util.*;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class SwitchReplacer {
     public static void replaceRawSwitches(Method method, List<Op03SimpleStatement> in, BlockIdentifierFactory blockIdentifierFactory, Options options) {
@@ -58,11 +89,30 @@ public class SwitchReplacer {
         boolean pullCodeIntoCase = options.getOption(OptionsImpl.PULL_CODE_CASE);
         for (Op03SimpleStatement switchStatement : switches) {
             // (assign switch block).
-            examineSwitchContiguity(switchStatement, in, pullCodeIntoCase);
+            switchStatement = examineSwitchContiguity(switchStatement, in, pullCodeIntoCase);
             moveJumpsToCaseStatements(switchStatement);
             moveJumpsToTerminalIfEmpty(switchStatement, in);
         }
+    }
 
+    /*
+     * This is a 'very silly' transform, but allows us to deal with a particularly fun class of bytecode implementation,
+     * which looks (vaguely) like duff's device.
+     *
+     * This produces significantly more legible code than would be found with a duplication technique.
+     * (though that may still be necessary if this doesn't succeed).
+     */
+    public static List<Op03SimpleStatement> rewriteDuff(List<Op03SimpleStatement> statements, VariableFactory vf, DecompilerComments decompilerComments, Options options) {
+        List<Op03SimpleStatement> switchStatements = Functional.filter(statements, new TypeFilter<SwitchStatement>(SwitchStatement.class));
+        boolean effect = false;
+        for (Op03SimpleStatement switchStatement : switchStatements) {
+            if (rewriteDuff(switchStatement, statements, vf, decompilerComments)) effect = true;
+        }
+        if (effect) {
+            decompilerComments.addComment(DecompilerComment.DUFF_HANDLING);
+            statements = Cleaner.sortAndRenumber(statements);
+        }
+        return statements;
     }
 
     private static Op03SimpleStatement replaceRawSwitch(@SuppressWarnings("unused") Method method, Op03SimpleStatement swatch, List<Op03SimpleStatement> in, BlockIdentifierFactory blockIdentifierFactory, Options options) {
@@ -96,14 +146,14 @@ public class SwitchReplacer {
             int idx = in.indexOf(swatch);
             if (idx + 1 >= in.size() || oneTarget != in.get(idx + 1)) {
                 // drop it completely.
-                swatch.replaceStatement(new GotoStatement());
+                swatch.replaceStatement(new GotoStatement(BytecodeLoc.TODO));
                 return null;
             }
             // emit an empty switch.
             swatch.replaceStatement(switchStatement.getSwitchStatement(switchBlockIdentifier));
             BlockIdentifier defBlock = blockIdentifierFactory.getNextBlockIdentifier(BlockType.CASE);
             Op03SimpleStatement defStm = new Op03SimpleStatement(swatch.getBlockIdentifiers(),
-                    new CaseStatement(ListFactory.<Expression>newList(), switchStatement.getSwitchOn().getInferredJavaType(), switchBlockIdentifier, defBlock),
+                    new CaseStatement(BytecodeLoc.TODO, ListFactory.<Expression>newList(), switchStatement.getSwitchOn().getInferredJavaType(), switchBlockIdentifier, defBlock),
                     swatch.getIndex().justAfter()
             );
             swatch.replaceTarget(oneTarget, defStm);
@@ -145,7 +195,7 @@ public class SwitchReplacer {
             Set<BlockIdentifier> blocks = SetFactory.newSet(target.getBlockIdentifiers());
             blocks.add(switchBlockIdentifier);
             BlockIdentifier caseIdentifier = blockIdentifierFactory.getNextBlockIdentifier(BlockType.CASE);
-            Op03SimpleStatement caseStatement = new Op03SimpleStatement(blocks, new CaseStatement(expression, caseType, switchBlockIdentifier, caseIdentifier), target.getIndex().justBefore());
+            Op03SimpleStatement caseStatement = new Op03SimpleStatement(blocks, new CaseStatement(BytecodeLoc.TODO, expression, caseType, switchBlockIdentifier, caseIdentifier), target.getIndex().justBefore());
             // Link casestatement in infront of target - all sources of target should point to casestatement instead, and
             // there should be one link going from caseStatement to target. (it's unambiguous).
             Iterator<Op03SimpleStatement> iterator = target.getSources().iterator();
@@ -166,7 +216,7 @@ public class SwitchReplacer {
                 // Order will be FIFO.
                 caseStatement.setIndex(nextIntermed);
                 nextIntermed = nextIntermed.justAfter();
-                Op03SimpleStatement intermediateGoto = new Op03SimpleStatement(blocks, new GotoStatement(), nextIntermed);
+                Op03SimpleStatement intermediateGoto = new Op03SimpleStatement(blocks, new GotoStatement(BytecodeLoc.TODO), nextIntermed);
                 nextIntermed = nextIntermed.justAfter();
                 intermediateGoto.addSource(caseStatement);
                 intermediateGoto.addTarget(target);
@@ -203,7 +253,7 @@ public class SwitchReplacer {
          * ...
          * goto a
          */
-        buildSwitchCases(swatch, targets, switchBlockIdentifier, in);
+        buildSwitchCases(swatch, targets, switchBlockIdentifier, in, false);
 
         swatch.replaceStatement(switchStatement.getSwitchStatement(switchBlockIdentifier));
         /*
@@ -214,7 +264,9 @@ public class SwitchReplacer {
         return swatch;
     }
 
-    private static void buildSwitchCases(Op03SimpleStatement swatch, List<Op03SimpleStatement> targets, BlockIdentifier switchBlockIdentifier, List<Op03SimpleStatement> in) {
+    private static void buildSwitchCases(final Op03SimpleStatement swatch, List<Op03SimpleStatement> targets, BlockIdentifier switchBlockIdentifier, List<Op03SimpleStatement> in, boolean forcedOrder) {
+        targets = ListFactory.newList(targets);
+        Collections.sort(targets, new CompareByIndex());
         Set<BlockIdentifier> caseIdentifiers = SetFactory.newSet();
         /*
          * For each of the case statements - find which is reachable from the others WITHOUT going through
@@ -230,7 +282,7 @@ public class SwitchReplacer {
          * // /Users/lee/Downloads/samples/android/support/v4/app/FragmentActivity.class
          */
         Map<Op03SimpleStatement, InstrIndex> lastStatementBefore = MapFactory.newMap();
-        for (Op03SimpleStatement target : targets) {
+        for (final Op03SimpleStatement target : targets) {
             CaseStatement caseStatement = (CaseStatement) target.getStatement();
             BlockIdentifier caseBlock = caseStatement.getCaseBlock();
 
@@ -238,7 +290,7 @@ public class SwitchReplacer {
                 target.markBlock(switchBlockIdentifier);
             }
 
-            NodeReachable nodeReachable = new NodeReachable(caseTargets, target, swatch);
+            NodeReachable nodeReachable = new NodeReachable(caseTargets, target, swatch, forcedOrder);
             GraphVisitor<Op03SimpleStatement> gv = new GraphVisitorDFS<Op03SimpleStatement>(target, nodeReachable);
             gv.process();
 
@@ -343,7 +395,7 @@ public class SwitchReplacer {
         }
         for (Op03SimpleStatement switchStatement : switchStatements) {
             SwitchStatement switchStatementInr = (SwitchStatement) switchStatement.getStatement();
-            buildSwitchCases(switchStatement, switchStatement.getTargets(), switchStatementInr.getSwitchBlock(), statements);
+            buildSwitchCases(switchStatement, switchStatement.getTargets(), switchStatementInr.getSwitchBlock(), statements, true);
         }
         boolean pullCodeIntoCase = options.getOption(OptionsImpl.PULL_CODE_CASE);
         for (Op03SimpleStatement switchStatement : switchStatements) {
@@ -367,7 +419,7 @@ public class SwitchReplacer {
         return true;
     }
 
-    private static void examineSwitchContiguity(Op03SimpleStatement switchStatement, List<Op03SimpleStatement> statements,
+    private static Op03SimpleStatement examineSwitchContiguity(Op03SimpleStatement switchStatement, List<Op03SimpleStatement> statements,
                                                 boolean pullCodeIntoCase) {
         Set<Op03SimpleStatement> forwardTargets = SetFactory.newSet();
 
@@ -375,10 +427,16 @@ public class SwitchReplacer {
         List<Op03SimpleStatement> targets = ListFactory.newList(switchStatement.getTargets());
         Collections.sort(targets, new CompareByIndex());
 
-        int idxFirstCase = statements.indexOf(targets.get(0));
+        Op03SimpleStatement firstCase = targets.get(0);
+        int idxFirstCase = statements.indexOf(firstCase);
 
         if (idxFirstCase != statements.indexOf(switchStatement) + 1) {
-            throw new ConfusedCFRException("First case is not immediately after switch.");
+            // We need to do a proper reordering, which is trickier with switches, as we need to discover
+            // content.  In the simplest case, we can move the start.
+            switchStatement = moveSwitch(switchStatement, statements, firstCase, idxFirstCase, targets);
+            if (switchStatement == null) {
+                throw new ConfusedCFRException("First case is not immediately after switch.");
+            }
         }
 
         BlockIdentifier switchBlock = ((SwitchStatement) switchStatement.getStatement()).getSwitchBlock();
@@ -452,7 +510,7 @@ public class SwitchReplacer {
                             /*
                              * Need to change last's target to a GOTO, which jumps to last's original target.
                              */
-                            Op03SimpleStatement newGoto = new Op03SimpleStatement(last.getBlockIdentifiers(), new GotoStatement(), moveTo);
+                            Op03SimpleStatement newGoto = new Op03SimpleStatement(last.getBlockIdentifiers(), new GotoStatement(BytecodeLoc.TODO), moveTo);
                             Op03SimpleStatement originalTgt = last.getTargets().get(0);
                             last.replaceTarget(originalTgt, newGoto);
                             originalTgt.replaceSource(last, newGoto);
@@ -510,10 +568,13 @@ public class SwitchReplacer {
                 Op03SimpleStatement target = statements.get(indexLastCase);
                 // We expect target to be our case statement - and IT should have 1 target.
                 boolean handled = false;
-                if (target.getStatement() instanceof CaseStatement) {
+                Statement targetStatement = target.getStatement();
+                if (targetStatement instanceof CaseStatement) {
+                    caseBlock = ((CaseStatement) targetStatement).getCaseBlock();
                     Op03SimpleStatement t2 = target.getTargets().get(0);
-                    if (t2.getStatement() instanceof ReturnStatement) {
-                        Op03SimpleStatement dupCase = new Op03SimpleStatement(switchStatement.getBlockIdentifiers(), target.getStatement(), lastInBlock.getIndex().justAfter());
+                    Statement statement = t2.getStatement();
+                    if (statement instanceof ReturnStatement || statement instanceof GotoStatement) {
+                        Op03SimpleStatement dupCase = new Op03SimpleStatement(switchStatement.getBlockIdentifiers(), targetStatement, lastInBlock.getIndex().justAfter());
                         indexLastCase = indexLastInLastBlock + 1;
                         statements.add(indexLastCase, dupCase);
                         target.removeSource(switchStatement);
@@ -521,10 +582,17 @@ public class SwitchReplacer {
                         switchStatement.replaceTarget(target, dupCase);
                         dupCase.addSource(switchStatement);
 
-                        Op03SimpleStatement dupReturn = new Op03SimpleStatement(dupCase.getBlockIdentifiers(), t2.getStatement(), dupCase.getIndex().justAfter());
-                        statements.add(indexLastCase+1, dupReturn);
-                        dupCase.addTarget(dupReturn);
-                        dupReturn.addSource(dupCase);
+                        Op03SimpleStatement dupStm = new Op03SimpleStatement(dupCase.getBlockIdentifiers(), statement, dupCase.getIndex().justAfter());
+                        statements.add(indexLastCase+1, dupStm);
+                        dupCase.addTarget(dupStm);
+                        dupStm.addSource(dupCase);
+                        dupStm.getBlockIdentifiers().addAll(Arrays.asList(caseBlock, switchBlock));
+                        lastCase = dupCase;
+                        for (Op03SimpleStatement tgt : t2.getTargets()) {
+                            dupStm.addTarget(tgt);
+                            tgt.addSource(dupStm);
+                        }
+
                         handled = true;
                     }
                 }
@@ -554,7 +622,7 @@ public class SwitchReplacer {
                 Set<BlockIdentifier> blockIdentifiers = SetFactory.newSet(lastInThis.getBlockIdentifiers());
                 blockIdentifiers.remove(caseBlock);
                 blockIdentifiers.remove(switchBlock);
-                Op03SimpleStatement retie = new Op03SimpleStatement(blockIdentifiers, new GotoStatement(), lastInThis.getIndex().justAfter());
+                Op03SimpleStatement retie = new Op03SimpleStatement(blockIdentifiers, new GotoStatement(BytecodeLoc.TODO), lastInThis.getIndex().justAfter());
                 Op03SimpleStatement target = lastInThis.getTargets().get(0);
                 Iterator<Op03SimpleStatement> iterator = target.getSources().iterator();
                 while (iterator.hasNext()) {
@@ -580,7 +648,7 @@ public class SwitchReplacer {
          * Sanity check:
          * If we've SOMEHOW decided the break target is inside the switch, we're wrong.
          */
-        if (breakStatementTarget.getBlockIdentifiers().contains(switchBlock)) return;
+        if (breakStatementTarget.getBlockIdentifiers().contains(switchBlock)) return switchStatement;
 
         /*
          * Follow the graph backwards - anything that's an effective jump to the breakstatementtarget
@@ -630,12 +698,46 @@ public class SwitchReplacer {
                 }
             }
         }
+        return switchStatement;
+    }
 
+    private static Op03SimpleStatement moveSwitch(Op03SimpleStatement switchStatement, List<Op03SimpleStatement> statements, Op03SimpleStatement firstCase, int idxFirstCase, List<Op03SimpleStatement> targets) {
+        if (idxFirstCase == 0) {
+            return null;
+        }
+
+        Statement swstm = switchStatement.getStatement();
+        Op03SimpleStatement pre = statements.get(idxFirstCase-1);
+        if (pre != firstCase.getLinearlyPrevious()) {
+            return null;
+        }
+        if (pre.getStatement() instanceof SwitchStatement || pre.getTargets().contains(firstCase)) {
+            return null;
+        }
+
+        switchStatement.replaceStatement(new GotoStatement(BytecodeLoc.NONE));
+        Op03SimpleStatement gotostm = switchStatement;
+        gotostm.getTargets().clear();
+
+        switchStatement = new Op03SimpleStatement(switchStatement.getBlockIdentifiers(),
+                swstm,
+                switchStatement.getSSAIdentifiers(),
+                firstCase.getIndex().justBefore());
+        statements.add(switchStatement);
+        gotostm.addTarget(switchStatement);
+        switchStatement.addSource(gotostm);
+        for (Op03SimpleStatement target : targets) {
+            target.replaceSource(gotostm, switchStatement);
+        }
+        switchStatement.getTargets().addAll(targets);
+        return switchStatement;
     }
 
     /*
      * If we have jumps from DIFFERENT cases into the start of a new case, we need to make sure that they
      * now refer to the case statement, not the start.
+     *
+     * (Of course, if these are invalid jumps then they signal some kind of duff).
      */
     private static void moveJumpsToCaseStatements(Op03SimpleStatement switchStatement) {
 
@@ -728,7 +830,7 @@ public class SwitchReplacer {
                 following.replaceStatement(new CommentStatement(""));
                 Op03SimpleStatement force = new Op03SimpleStatement(
                         following.getBlockIdentifiers(),
-                        new GotoStatement(),
+                        new GotoStatement(BytecodeLoc.TODO),
                         following.getSSAIdentifiers(),
                         following.getIndex().justAfter());
                 Op03SimpleStatement followingTgt = following.getTargets().get(0);
@@ -778,13 +880,15 @@ public class SwitchReplacer {
         private final Op03SimpleStatement switchStatement;
 
         private final Op03SimpleStatement start;
+        private final boolean forcedOrder;
         private final List<Op03SimpleStatement> reaches = ListFactory.newList();
         private final Set<Op03SimpleStatement> inBlock = SetFactory.newSet();
 
-        private NodeReachable(Set<Op03SimpleStatement> otherCases, Op03SimpleStatement start, Op03SimpleStatement switchStatement) {
+        private NodeReachable(Set<Op03SimpleStatement> otherCases, Op03SimpleStatement start, Op03SimpleStatement switchStatement, boolean forcedOrder) {
             this.otherCases = otherCases;
             this.switchStatement = switchStatement;
             this.start = start;
+            this.forcedOrder = forcedOrder;
         }
 
         @Override
@@ -794,7 +898,7 @@ public class SwitchReplacer {
             }
             if (arg1.getIndex().isBackJumpFrom(start)) {
                 // If it's a backjump from the switch statement as well, ignore.  Otherwise we have to process.
-                if (arg1.getIndex().isBackJumpFrom(switchStatement)) return;
+                if (forcedOrder || arg1.getIndex().isBackJumpFrom(switchStatement)) return;
             }
             if (arg1 != start && otherCases.contains(arg1)) {
                 reaches.add(arg1);
@@ -931,7 +1035,7 @@ public class SwitchReplacer {
         // and redirect via that.
         if (ultTarget.getIndex().isBackJumpFrom(switchStatement)) {
             targetIndex = targetIndex.justAfter();
-            Op03SimpleStatement ultTargetNew = new Op03SimpleStatement(lastStatement.getBlockIdentifiers(), new GotoStatement(), targetIndex);
+            Op03SimpleStatement ultTargetNew = new Op03SimpleStatement(lastStatement.getBlockIdentifiers(), new GotoStatement(BytecodeLoc.TODO), targetIndex);
             statements.add(ultTargetNew);
             ultTargetNew.addTarget(ultTarget);
             ultTarget.addSource(ultTargetNew);
@@ -949,5 +1053,164 @@ public class SwitchReplacer {
         List<BlockIdentifier> newInFirst = SetUtil.differenceAtakeBtoList(firstBlocks, switchStatement.getBlockIdentifiers());
         Cleaner.sortAndRenumberInPlace(statements);
         switchStatement.getBlockIdentifiers().addAll(newInFirst);
+    }
+
+    private static boolean rewriteDuff(Op03SimpleStatement switchStatement, List<Op03SimpleStatement> statements, VariableFactory vf, DecompilerComments decompilerComments) {
+        BlockIdentifier switchBlock = ((SwitchStatement) switchStatement.getStatement()).getSwitchBlock();
+        int indexLastInLastBlock = 0;
+        // Process all but the last target.  (handle that below, as we may treat it as outside the case block
+        // depending on forward targets.
+        List<Op03SimpleStatement> targets = ListFactory.newList(switchStatement.getTargets());
+        Collections.sort(targets, new CompareByIndex());
+        BlockIdentifier prevBlock = null;
+        BlockIdentifier nextBlock = null;
+        Map<Op03SimpleStatement, List<Op03SimpleStatement>> badSrcMap = MapFactory.newOrderedMap();
+        for (Op03SimpleStatement cas : targets) {
+            // This can only have legitimate sources of the preceeding switch block (linearly preceeding),
+            // the switch statements itself, or (in theory) another statement in the same block.
+            // anything else is duffesque.
+            Statement casStm = cas.getStatement();
+            if (!(casStm instanceof CaseStatement)) {
+                continue;
+            }
+            CaseStatement caseStm = (CaseStatement)casStm;
+            BlockIdentifier caseBlock = caseStm.getCaseBlock();
+            prevBlock = nextBlock;
+            nextBlock = caseBlock;
+            List<Op03SimpleStatement> badSources = null;
+            for (Op03SimpleStatement casSrc : cas.getSources()) {
+                if (casSrc == switchStatement) continue;
+                if (casSrc.getBlockIdentifiers().contains(caseBlock)) continue;
+                if (casSrc.getBlockIdentifiers().contains(prevBlock)) continue;
+                // strictly speaking, this is not valid, but because we pull defaults out, we can handle it.
+                if (caseStm.isDefault()) continue;
+                // casSrc illegally jumps to cas.
+                // we can fix this by jumping to the switch, and faking the thing we switch on.
+                if (badSources == null) {
+                    badSources = ListFactory.newList();
+                }
+                badSources.add(casSrc);
+            }
+            if (badSources != null) {
+                badSrcMap.put(cas, badSources);
+            }
+        }
+        if (badSrcMap.isEmpty()) return false;
+
+        // Ok - we can un-duff this.  Redirect all jumps to cases to be jumps to the switch, and
+        // add an additional control
+        LValue intermed = vf.tempVariable(new InferredJavaType(RawJavaType.INT, InferredJavaType.Source.TRANSFORM));
+        // We need to find a value which ISN'T a valid source.
+        Set<Integer> iVals = SetFactory.newSortedSet();
+        for (Op03SimpleStatement cas : targets) {
+            // This can only have legitimate sources of the preceeding switch block (linearly preceeding),
+            // the switch statements itself, or (in theory) another statement in the same block.
+            // anything else is duffesque.
+            Statement casStm = cas.getStatement();
+            if (!(casStm instanceof CaseStatement)) {
+                continue;
+            }
+            CaseStatement caseStm = (CaseStatement) casStm;
+            List<Expression> values = caseStm.getValues();
+            for (Expression e : values) {
+                Literal l = e.getComputedLiteral(MapFactory.<LValue, Literal>newMap());
+                if (l == null) return false;
+                iVals.add(l.getValue().getIntValue());
+            }
+        }
+        Integer prev = null;
+        Integer testValue = null;
+        if (!iVals.contains(0)) {
+            testValue = 0;
+        } else {
+            for (Integer i : iVals) {
+                if (prev == null) {
+                    if (i > Integer.MIN_VALUE) {
+                        testValue = Integer.MIN_VALUE;
+                        break;
+                    } else {
+                        prev = i;
+                    }
+                } else {
+                    if (prev - i > 1) {
+                        testValue = i-1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (testValue == null) return false;
+        Literal testVal = new Literal(TypedLiteral.getInt(testValue));
+        Op03SimpleStatement newPreSwitch = new Op03SimpleStatement(switchStatement.getBlockIdentifiers(), new AssignmentSimple(BytecodeLoc.NONE, intermed, testVal), switchStatement.getIndex().justBefore());
+        statements.add(newPreSwitch);
+        List<Op03SimpleStatement> switchStatementSources = switchStatement.getSources();
+        for (Op03SimpleStatement source : switchStatementSources) {
+            source.replaceTarget(switchStatement, newPreSwitch);
+            newPreSwitch.addSource(source);
+        }
+        newPreSwitch.addTarget(switchStatement);
+        switchStatementSources.clear();
+        switchStatementSources.add(newPreSwitch);
+        SwitchStatement swatch = (SwitchStatement)switchStatement.getStatement();
+        Expression e = swatch.getSwitchOn();
+
+        e = new TernaryExpression(BytecodeLoc.NONE, new ComparisonOperation(BytecodeLoc.NONE, new LValueExpression(intermed), testVal, CompOp.EQ), e, new LValueExpression(intermed));
+        swatch.setSwitchOn(e);
+
+        Set<Op03SimpleStatement> switchContent = Misc.GraphVisitorBlockReachable.getBlockReachable(switchStatement, switchBlock);
+        Op03SimpleStatement last = Misc.getLastInRangeByIndex(switchContent);
+
+        Op03SimpleStatement afterLast = last.getLinearlyNext();
+
+        // After the switch, we need a
+        // while (magic != missing).  This is what all the other statements will jump to.
+        // (rather than continuing directly).
+
+        if (afterLast == null) return false;
+        Op03SimpleStatement newPostSwitch = new Op03SimpleStatement(afterLast.getBlockIdentifiers(), new IfStatement(BytecodeLoc.NONE, new BooleanExpression(Literal.TRUE)), afterLast.getIndex().justBefore());
+        newPostSwitch.addTarget(afterLast);
+        newPostSwitch.addTarget(switchStatement);
+        afterLast.addSource(newPostSwitch);
+        switchStatement.addSource(newPostSwitch);
+        statements.add(newPostSwitch);
+
+        Op03SimpleStatement newBreak = new Op03SimpleStatement(newPostSwitch.getBlockIdentifiers(), new GotoStatement(BytecodeLoc.NONE), newPostSwitch.getIndex().justBefore());
+        List<Op03SimpleStatement> postSources = ListFactory.newList(afterLast.getSources());
+        for (Op03SimpleStatement source : postSources) {
+            if (source.getBlockIdentifiers().contains(switchBlock)) {
+                source.replaceTarget(afterLast, newBreak);
+                newBreak.addSource(source);
+                afterLast.removeSource(source);
+            }
+        }
+        if (!newBreak.getSources().isEmpty()) {
+            newBreak.addTarget(afterLast);
+            afterLast.addSource(newBreak);
+            statements.add(newBreak);
+        }
+
+        for (Map.Entry<Op03SimpleStatement, List<Op03SimpleStatement>> entry : badSrcMap.entrySet()) {
+            Op03SimpleStatement cas = entry.getKey();
+            CaseStatement caseStatement = (CaseStatement)cas.getStatement();
+            List<Expression> values = caseStatement.getValues();
+            if (values.isEmpty()) continue;
+            Expression oneValue = values.get(0);
+            for (Op03SimpleStatement src : entry.getValue()) {
+                cas.removeSource(src);
+                Op03SimpleStatement newPreJump = new Op03SimpleStatement(src.getBlockIdentifiers(), new AssignmentSimple(BytecodeLoc.NONE, intermed, oneValue), src.getIndex().justBefore());
+                statements.add(newPreJump);
+                List<Op03SimpleStatement> srcSources = src.getSources();
+                for (Op03SimpleStatement srcSrc : srcSources) {
+                    srcSrc.replaceTarget(src, newPreJump);
+                    newPreJump.addSource(srcSrc);
+                }
+                srcSources.clear();
+                srcSources.add(newPreJump);
+                newPreJump.addTarget(src);
+                src.replaceTarget(cas, newPostSwitch);
+                newPostSwitch.addSource(src);
+            }
+        }
+        return true;
     }
 }

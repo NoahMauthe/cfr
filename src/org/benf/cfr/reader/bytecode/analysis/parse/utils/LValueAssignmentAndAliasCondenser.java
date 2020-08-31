@@ -1,5 +1,6 @@
 package org.benf.cfr.reader.bytecode.analysis.parse.utils;
 
+import org.benf.cfr.reader.bytecode.analysis.loc.BytecodeLoc;
 import org.benf.cfr.reader.bytecode.analysis.opgraph.Op03SimpleStatement;
 import org.benf.cfr.reader.bytecode.analysis.parse.Expression;
 import org.benf.cfr.reader.bytecode.analysis.parse.LValue;
@@ -235,6 +236,7 @@ public class LValueAssignmentAndAliasCondenser implements LValueRewriter<Stateme
                 return null;
             }
             lvSc.copyBlockInformationFrom(statementContainer);
+            lvSc.copyBytecodeInformationFrom(statementContainer);
             statementContainer.nopOut();
         }
 
@@ -270,7 +272,7 @@ public class LValueAssignmentAndAliasCondenser implements LValueRewriter<Stateme
             res = res.replaceSingleUsageLValues(this, ssaIdentifiers, lvSc);
         }
 
-        cache.put(new StackValue(stackSSALabel), prev);
+        cache.put(new StackValue(BytecodeLoc.NONE, stackSSALabel), prev);
 
         return prev;
     }
@@ -467,7 +469,6 @@ public class LValueAssignmentAndAliasCondenser implements LValueRewriter<Stateme
                 if (verifyStatement.getStatement().doesBlackListLValueReplacement(stackSSALabel, target.expression)) return null;
                 for (LValue checkThis : checkThese) {
                     if (guessStatement == verifyStatement) continue;
-                    //noinspection unchecked
                     if (!verifyStatement.getSSAIdentifiers().isValidReplacement(checkThis, guessStatement.getSSAIdentifiers())) {
                         return null;
                     }
@@ -645,7 +646,6 @@ public class LValueAssignmentAndAliasCondenser implements LValueRewriter<Stateme
                     StatementContainer<Statement> replacement = replaceWith.statementContainer;
                     if (replacement == statementContainer) return null;
 
-                    //noinspection unchecked
                     SSAIdentifiers<LValue> previousIdents = replacement.getSSAIdentifiers();
                     Set fixedPrevious = previousIdents.getFixedHere();
                     if (SetUtil.hasIntersection(this.fixed, fixedPrevious)) {
@@ -662,7 +662,6 @@ public class LValueAssignmentAndAliasCondenser implements LValueRewriter<Stateme
                     // Only the first time.
                     mutableReplacable.remove(versionedLValue);
                     replacement.nopOut();
-                    //noinspection unchecked
                     currentIdents.setKnownIdentifierOnEntry(lValue, previousIdents.getSSAIdentOnEntry(lValue));
                     currentIdents.fixHere(previousIdents.getFixedHere());
                     return replaceWith.expression;

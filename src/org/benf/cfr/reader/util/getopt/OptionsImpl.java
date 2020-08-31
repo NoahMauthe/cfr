@@ -492,6 +492,9 @@ public class OptionsImpl implements Options {
     public static final PermittedOptionProvider.Argument<Troolean> AGGRESSIVE_DO_EXTENSION = register(new PermittedOptionProvider.Argument<Troolean>(
             "aggressivedoextension", defaultNeitherTrooleanDecoder,
             "Fold impossible jumps into do loops with 'first' test"));
+    public static final PermittedOptionProvider.Argument<Troolean> AGGRESSIVE_DUFF = register(new PermittedOptionProvider.Argument<Troolean>(
+            "aggressiveduff", defaultNeitherTrooleanDecoder,
+            "Fold duff device style switches with additional control."));
     public static final PermittedOptionProvider.Argument<Integer> AGGRESSIVE_DO_COPY = register(new PermittedOptionProvider.Argument<Integer>(
             "aggressivedocopy", new DefaultingIntDecoder(0),
             "Clone code from impossible jumps into loops with 'first' test"));
@@ -531,6 +534,9 @@ public class OptionsImpl implements Options {
     public static final PermittedOptionProvider.Argument<String> OBFUSCATION_PATH = register(new PermittedOptionProvider.Argument<String>(
             "obfuscationpath", defaultNullStringDecoder,
             "Path to obfuscation symbol remapping file"));
+    public static final PermittedOptionProvider.Argument<Boolean> TRACK_BYTECODE_LOC = register(new PermittedOptionProvider.Argument<Boolean>(
+            "trackbytecodeloc", defaultFalseBooleanDecoder,
+            "Propagate bytecode location info."));
 
 
     public OptionsImpl(Map<String, String> opts) {

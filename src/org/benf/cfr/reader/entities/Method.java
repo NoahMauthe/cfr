@@ -128,6 +128,12 @@ public class Method implements KnowsRawSize, TypeUsageCollectable {
             methodConstructor = isEnum ? MethodConstructor.ENUM_CONSTRUCTOR : MethodConstructor.CONSTRUCTOR;
         } else if (initialName.equals(MiscConstants.STATIC_INIT_METHOD)) {
             methodConstructor = MethodConstructor.STATIC_CONSTRUCTOR;
+
+            // JVM Spec 2nd ed., chapter 4.6: All access flags except static for class initializers are ignored
+            // Pre java 7 class files even allow static initializers to be non-static
+            // See classFileParser.cpp#parse_method
+            accessFlags.clear();
+            accessFlags.add(AccessFlagMethod.ACC_STATIC);
         }
         this.isConstructor = methodConstructor;
         if (methodConstructor.isConstructor() && accessFlags.contains(AccessFlagMethod.ACC_STRICT)) {
@@ -280,13 +286,13 @@ public class Method implements KnowsRawSize, TypeUsageCollectable {
         }
         if (signature != null) {
             try {
-                sigproto = ConstantPoolUtils.parseJavaMethodPrototype(state, classFile, classFile.getClassType(), initialName, isInstance, constructorFlag, signature, cp, isVarargs, isSynthetic, variableNamer);
+                sigproto = ConstantPoolUtils.parseJavaMethodPrototype(state, classFile, classFile.getClassType(), initialName, isInstance, constructorFlag, signature, cp, isVarargs, isSynthetic, variableNamer, descriptor.getValue());
             } catch (MalformedPrototypeException e) {
                 // deliberately empty.
             }
         }
         try {
-            desproto = ConstantPoolUtils.parseJavaMethodPrototype(state, classFile, classFile.getClassType(), initialName, isInstance, constructorFlag, descriptor, cp, isVarargs, isSynthetic, variableNamer);
+            desproto = ConstantPoolUtils.parseJavaMethodPrototype(state, classFile, classFile.getClassType(), initialName, isInstance, constructorFlag, descriptor, cp, isVarargs, isSynthetic, variableNamer, descriptor.getValue());
         } catch (MalformedPrototypeException e) {
             if (sigproto == null) throw e;
             // this shouln't be possible, but we might be able to handle it.
