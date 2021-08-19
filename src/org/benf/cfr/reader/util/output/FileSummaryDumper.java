@@ -57,7 +57,7 @@ public class FileSummaryDumper implements SummaryDumper {
                     MethodPrototype prototype = method.getMethodPrototype();
 //                    writer.write(prototype.toString() + "\n");
                     writer.write("FAILED_METHOD:\t" + prototype.getClassType().getRawName() + " " +
-                            prototype.getReturnType() + " " + prototype.toString() + "\n");
+                            prototype.getReturnType() + " " + prototype.toString() + ";" + error + "\n");
                 }
                 lastMethod = method;
             }
